@@ -61,6 +61,14 @@ The cache level hierarchy is:
    to avoid the dog-pile effect on your database/backend
    (via [lua-resty-lock]). Values fetched via L3 will be set to the L2 cache
    for other workers to access.
+- **L4**: a *virtual* layer that signals the usage of stale data. This can
+  happen when the L3 callback gracefully fails (by returning `nil, error`)
+  *and* the expired value was still in the L2 dictionary.   The usage of stale
+  data is optional and disabled by default (see the [new](#new) function). It
+  might be desirable to use stale data when the L3 callback encounters a
+  timeout for instance: using stale data can be better than returning an error.
+  Note that the you can't rely on the stale value still being stored in the
+  shared dictionary as it might be evicted at any time.
 
 # Table of Contents
 
@@ -218,6 +226,14 @@ holding the desired options for this instance. The possible options are:
   accepts fractional number parts, like `0.3`. A `neg_ttl` of `0` means the
   cached misses will never expire.
   **Default:** `5`.
+- `stale_ttl`: a number specifying the expiration time period of stale data.
+  When the L3 callback returns `nil, error` *and* the L2 cache still has stale
+  data, then that data will be "resurrected" for `stale_ttl` seconds before
+  attempting to call the L3 callback again for that key. This is best effort
+  as stale data might be evicted at any time after its expiration. If provided,
+  `stale_ttl` must be strictly positive, as caching stale data forever does not
+  make sense.
+  **Default:** do not use stale data at all.
 - `lru`: a lua-resty-lrucache instance of your choice. If specified, mlcache
   will not instantiate an LRU. One can use this value to use the
   `resty.lrucache.pureffi` implementation of lua-resty-lrucache if desired.
@@ -316,7 +332,7 @@ second return value `err` to determine if this method succeeded or not**.
 
 The third return value is a number which is set if no error was encountered.
 It indicated the level at which the value was fetched: `1` for L1, `2` for L2,
-and `3` for L3.
+`3` for L3 and `4` when stale data is used (see `stale_ttl`).
 
 If an error is encountered, this method returns `nil` plus a string describing
 the error.
@@ -337,6 +353,14 @@ options:
   accepts fractional number parts, like `0.3`. A `neg_ttl` of `0` means the
   cached misses will never expire.
   **Default:** inherited from the instance.
+- `stale_ttl`: a number specifying the expiration time period of stale data.
+  When the L3 callback returns `nil, error` *and* the L2 cache still has stale
+  data, then that data will be "resurrected" for `stale_ttl` seconds before
+  attempting to call the L3 callback again for that key. This is best effort
+  as stale data might be evicted at any time after its expiration. If provided,
+  `stale_ttl` must be strictly positive, as caching stale data forever does not
+  make sense.
+  **Default:** inherited from instance.
 - `shm_set_tries`: the number of tries for the lua_shared_dict `set()`
   operation. When the lua_shared_dict is full, it attempts to free up to 30
   items from its queue. When the value being set is much larger than the freed
@@ -398,7 +422,9 @@ When called, `get()` follows the below steps:
 4. a single worker runs the L3 callback.
 5. the callback returns (ex: it performed a database query), and the worker
    sets the value in the L2 cache. It then sets it in its L1 cache as well
-   (as-is by default, or as returned by `l1_serializer` if specified).
+   (as-is by default, or as returned by `l1_serializer` if specified). If the
+   callback fails gracefully *and* `stale_ttl` was set, then the L2 stale value
+   (if any) is used as a fallback.
 6. other workers that were trying to access the same value but were waiting
    fetch the value from the L2 cache (they do not run the L3 callback) and
    return it.
@@ -516,7 +542,8 @@ still several orders of magnitude faster than the L3 callback.
 
 As its only intent is to take a "peek" into the cache to determine its warmth
 for a given value, `peek()` does not count as a query like [get()](#get), and
-does not set the value in the L1 cache.
+does not set the value in the L1 cache. It does not either return stale values,
+even if `stale_ttl` has been set in the cache instance.
 
 Example:
 

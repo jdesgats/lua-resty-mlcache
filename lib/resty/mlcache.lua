@@ -178,6 +178,16 @@ function _M.new(name, shm, opts)
             end
         end
 
+        if opts.stale_ttl ~= nil then
+            if type(opts.stale_ttl) ~= "number" then
+                error("opts.stale_ttl must be a number", 2)
+            end
+
+            if opts.stale_ttl <= 0 then
+                error("opts.stale_ttl must be > 0", 2)
+            end
+        end
+
         if opts.resty_lock_opts ~= nil
             and type(opts.resty_lock_opts) ~= "table"
         then
@@ -255,6 +265,7 @@ function _M.new(name, shm, opts)
         shm_miss        = opts.shm_miss,
         ttl             = opts.ttl     or 30,
         neg_ttl         = opts.neg_ttl or 5,
+        stale_ttl       = opts.stale_ttl,
         lru_size        = opts.lru_size or 100,
         resty_lock_opts = opts.resty_lock_opts,
         l1_serializer   = opts.l1_serializer,
@@ -450,21 +461,26 @@ local function set_shm(self, shm_key, value, ttl, neg_ttl, shm_set_tries)
 end
 
 
-local function get_shm_set_lru(self, key, shm_key, l1_serializer)
-    local v, err = self.dict:get(shm_key)
+local function get_shm_set_lru(self, key, shm_key, l1_serializer, wants_stale)
+    -- do not always use get_stale here as the get methods evicts stale entries
+    -- directly, which eases the memory management for later
+    local dict_getter = wants_stale and self.dict.get_stale or self.dict.get
+
+    local v, err, stale = dict_getter(self.dict, shm_key)
+
     if err then
         return nil, "could not read from lua_shared_dict: " .. err
     end
 
     if self.shm_miss and v == nil then
         -- if we cache misses in another shm, maybe it is there
-        v, err = self.dict_miss:get(shm_key)
+        v, err, stale = dict_getter(self.dict_miss, shm_key)
         if err then
             return nil, "could not read from lua_shared_dict: " .. err
         end
     end
 
-    if v ~= nil then
+    if v ~= nil and not stale then
         local str_serialized, value_type, at, ttl = unmarshallers.shm_value(v)
 
         local remaining_ttl
@@ -492,6 +508,7 @@ local function get_shm_set_lru(self, key, shm_key, l1_serializer)
         return set_lru(self, key, value, remaining_ttl, remaining_ttl,
                        l1_serializer)
     end
+    return nil, nil, v
 end
 
 
@@ -500,6 +517,7 @@ local function check_opts(self, opts)
     local neg_ttl
     local l1_serializer
     local shm_set_tries
+    local stale_ttl
 
     if opts ~= nil then
         if type(opts) ~= "table" then
@@ -543,6 +561,17 @@ local function check_opts(self, opts)
                 error("opts.shm_set_tries must be >= 1", 3)
             end
         end
+
+        stale_ttl = opts.stale_ttl
+        if stale_ttl ~= nil then
+            if type(stale_ttl) ~= "number" then
+                error("opts.stale_ttl must be a number", 3)
+            end
+
+            if stale_ttl <= 0 then
+                error("opts.stale_ttl must be > 0", 3)
+            end
+        end
     end
 
     if not ttl then
@@ -561,7 +590,11 @@ local function check_opts(self, opts)
         shm_set_tries = self.shm_set_tries
     end
 
-    return ttl, neg_ttl, l1_serializer, shm_set_tries
+    if not stale_ttl then
+        stale_ttl = self.stale_ttl
+    end
+
+    return ttl, neg_ttl, l1_serializer, shm_set_tries, stale_ttl
 end
 
 
@@ -574,6 +607,41 @@ local function unlock_and_ret(lock, res, err, hit_lvl)
     return res, err, hit_lvl
 end
 
+
+local function resurect_stale_value(self, key, namespaced_key,
+        marshalled_stale, stale_ttl, shm_set_tries, l1_serializer)
+
+    local data, err
+    local str_serialized, value_type = unmarshallers.shm_value(marshalled_stale)
+    -- value_type of 0 is a nil entry
+    if value_type == 0 then
+        data = nil
+    else
+        data, err = unmarshallers[value_type](str_serialized)
+        if err then
+            return nil, "could not deserialize stale value:" .. err
+        end
+    end
+
+    local ok, err = set_shm(self, namespaced_key, data, stale_ttl, stale_ttl,
+                            shm_set_tries)
+    if not ok then
+        return nil, err
+    end
+
+    -- set our own worker's LRU cache
+
+    data, err = set_lru(self, key, data, stale_ttl, stale_ttl, l1_serializer)
+    if err then
+        return nil, err
+    end
+
+    if data == CACHE_MISS_SENTINEL_LRU then
+        return nil
+    end
+
+    return data
+end
 
 function _M:get(key, opts, cb, ...)
     if type(key) ~= "string" then
@@ -604,10 +672,10 @@ function _M:get(key, opts, cb, ...)
 
     -- opts validation
 
-    local ttl, neg_ttl, l1_serializer, shm_set_tries = check_opts(self, opts)
+    local ttl, neg_ttl, l1_serializer, shm_set_tries, stale_ttl = check_opts(self, opts)
 
-    local err
-    data, err = get_shm_set_lru(self, key, namespaced_key, l1_serializer)
+    local err, stale
+    data, err, stale = get_shm_set_lru(self, key, namespaced_key, l1_serializer, stale_ttl)
     if err then
         return nil, err
     end
@@ -653,6 +721,16 @@ function _M:get(key, opts, cb, ...)
     -- finished to run the callback
 
     if lerr == "timeout" then
+        if stale then
+            data, err = resurect_stale_value(self, key, namespaced_key, stale,
+                                             stale_ttl, shm_set_tries, l1_serializer)
+            if err then
+                return nil, "could not use stale value after lock timeout: " ..
+                            err
+            end
+
+            return data, nil, 4
+        end
         return nil, "could not acquire callback lock: timeout"
     end
 
@@ -668,7 +746,18 @@ function _M:get(key, opts, cb, ...)
 
     if err then
         -- callback returned nil + err
-        return unlock_and_ret(lock, data, err)
+        -- check if we have a stale value
+        if stale then
+            data, err = resurect_stale_value(self, key, namespaced_key, stale,
+                                             stale_ttl, shm_set_tries, l1_serializer)
+            if err then
+                return unlock_and_ret(lock, data, err)
+            end
+
+            return unlock_and_ret(lock, data, nil, 4)
+        else
+            return unlock_and_ret(lock, data, err)
+        end
     end
 
     -- override ttl / neg_ttl
@@ -716,8 +805,9 @@ function _M:peek(key)
     -- mlcache instance from potential other instances using the same
     -- shm
     local namespaced_key = self.name .. key
+    local dict_getter = self.stale_ttl and self.dict.get_stale or self.dict.get
 
-    local v, err = self.dict:get(namespaced_key)
+    local v, err, stale = dict_getter(self.dict, namespaced_key)
     if err then
         return nil, "could not read from lua_shared_dict: " .. err
     end
@@ -725,13 +815,13 @@ function _M:peek(key)
     -- if we specified shm_miss, it might be a negative hit cached
     -- there
     if self.dict_miss and v == nil then
-        v, err = self.dict_miss:get(namespaced_key)
+        v, err, stale = dict_getter(self.dict_miss, namespaced_key)
         if err then
             return nil, "could not read from lua_shared_dict: " .. err
         end
     end
 
-    if v ~= nil then
+    if v ~= nil and not stale then
         local str_serialized, value_type, at, ttl = unmarshallers.shm_value(v)
 
         local remaining_ttl = ttl - (now() - at)

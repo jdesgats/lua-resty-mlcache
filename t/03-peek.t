@@ -357,3 +357,52 @@ GET /t
 [error]
 --- error_log eval
 qr/\[TRACE\s+\d+ content_by_lua\(nginx\.conf:\d+\):6 loop\]/
+
+
+
+=== TEST 9: peek() does not flush stale entries if stale_ttl is set
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local mlcache = require "resty.mlcache"
+
+            local cache, err = mlcache.new("my_mlcache", "cache_shm", {
+                ttl=0.3,
+                stale_ttl = 0.2,
+            })
+
+            if not cache then
+                ngx.log(ngx.ERR, err)
+                return
+            end
+
+            local data, err, level = cache:get("key", nil, function()
+                return 42
+            end)
+            ngx.say(string.format("data=%s (%s); err=%s; level=%s", data, type(data), err, level))
+
+            ngx.sleep(0.4)
+
+            local ttl, err = cache:peek("my_key")
+            if err then
+                ngx.log(ngx.ERR, err)
+                return
+            end
+
+            ngx.say("ttl: ", tostring(ttl))
+
+            data, err, level = cache:get("key", nil, function()
+                return nil, "timeout"
+            end)
+            ngx.say(string.format("data=%s (%s); err=%s; level=%s", data, type(data), err, level))
+        }
+    }
+--- request
+GET /t
+--- response_body
+data=42 (number); err=nil; level=3
+ttl: nil
+data=42 (number); err=nil; level=4
+--- no_error_log
+[error]

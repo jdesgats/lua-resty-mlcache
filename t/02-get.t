@@ -2103,3 +2103,248 @@ sleeping...
 is stale: true
 --- no_error_log
 [error]
+
+
+
+=== TEST 44: get() doesn't return stale data by default
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local mlcache = require "resty.mlcache"
+
+            local cache = assert(mlcache.new("my_mlcache", "cache_shm", {
+                ttl = 0.3,
+            }))
+
+            local data, err, level = cache:get("key", nil, function()
+                return 42
+            end)
+            ngx.say(string.format("data=%s (%s); err=%s; level=%s", data, type(data), err, level))
+
+            data, err, level = cache:get("key", nil, error)
+            ngx.say(string.format("data=%s (%s); err=%s; level=%s", data, type(data), err, level))
+
+            ngx.say("sleeping...")
+            ngx.sleep(0.4)
+
+            data, err, level = cache:get("key", nil, function()
+                return nil, "timeout"
+            end)
+            ngx.say(string.format("data=%s (%s); err=%s; level=%s", data, type(data), err, level))
+        }
+    }
+--- request
+GET /t
+--- response_body
+data=42 (number); err=nil; level=3
+data=42 (number); err=nil; level=1
+sleeping...
+data=nil (nil); err=timeout; level=nil
+--- no_error_log
+[error]
+
+
+
+=== TEST 45: get() returns stale data if L3 callback fails gracefully
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local mlcache = require "resty.mlcache"
+
+            local cache = assert(mlcache.new("my_mlcache", "cache_shm", {
+                ttl = 0.3,
+                stale_ttl = 0.2,
+            }))
+
+            local data, err, level = cache:get("key", nil, function()
+                return 42
+            end)
+            ngx.say(string.format("data=%s (%s); err=%s; level=%s", data, type(data), err, level))
+
+            data, err, level = cache:get("key", nil, error)
+            ngx.say(string.format("data=%s (%s); err=%s; level=%s", data, type(data), err, level))
+
+            ngx.say("sleeping...")
+            ngx.sleep(0.4)
+
+            data, err, level = cache:get("key", nil, function()
+                return nil, "timeout"
+            end)
+            ngx.say(string.format("data=%s (%s); err=%s; level=%s", data, type(data), err, level))
+
+            data, err, level = cache:get("key", nil, function() error "oops" end)
+            ngx.say(string.format("data=%s (%s); err=%s; level=%s", data, type(data), err, level))
+
+            ngx.say("sleeping...")
+            ngx.sleep(0.25) -- more than stale_ttl but less than ttl
+
+            local data, err, level = cache:get("key", nil, function()
+                return 25
+            end)
+            ngx.say(string.format("data=%s (%s); err=%s; level=%s", data, type(data), err, level))
+        }
+    }
+--- request
+GET /t
+--- response_body
+data=42 (number); err=nil; level=3
+data=42 (number); err=nil; level=1
+sleeping...
+data=42 (number); err=nil; level=4
+data=42 (number); err=nil; level=1
+sleeping...
+data=25 (number); err=nil; level=3
+--- no_error_log
+[error]
+
+
+
+=== TEST 46: get() does not fetch stale data when callback raises a runtime error
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local mlcache = require "resty.mlcache"
+
+            local cache = assert(mlcache.new("my_mlcache", "cache_shm", {
+                ttl = 0.3,
+            }))
+
+            local data, err, level = cache:get("key", nil, function()
+                return 42
+            end)
+            ngx.say(string.format("data=%s (%s); err=%s; level=%s", data, type(data), err, level))
+
+            data, err, level = cache:get("key", nil, error)
+            ngx.say(string.format("data=%s (%s); err=%s; level=%s", data, type(data), err, level))
+
+            ngx.say("sleeping...")
+            ngx.sleep(0.4)
+
+            data, err, level = cache:get("key", nil, function()
+                error("oops")
+            end)
+            ngx.say(string.format("data=%s (%s); err=%s; level=%s", data, type(data), err, level))
+        }
+    }
+--- request
+GET /t
+--- response_body_like
+data=42 \(number\); err=nil; level=3
+data=42 \(number\); err=nil; level=1
+sleeping...
+data=nil \(nil\); err=callback threw an error: .*? oops; level=nil
+--- no_error_log
+[error]
+
+
+
+=== TEST 47: get() support a stale_ttl as an option too
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local mlcache = require "resty.mlcache"
+
+            local cache = assert(mlcache.new("my_mlcache", "cache_shm", {
+                ttl = 0.3,
+            }))
+
+            local data, err, level = cache:get("key", nil, function()
+                return 42
+            end)
+            ngx.say(string.format("data=%s (%s); err=%s; level=%s", data, type(data), err, level))
+
+            data, err, level = cache:get("key", nil, error)
+            ngx.say(string.format("data=%s (%s); err=%s; level=%s", data, type(data), err, level))
+
+            ngx.say("sleeping...")
+            ngx.sleep(0.4)
+
+            data, err, level = cache:get("key", { stale_ttl = 0.2 }, function()
+                return nil, "timeout"
+            end)
+            ngx.say(string.format("data=%s (%s); err=%s; level=%s", data, type(data), err, level))
+
+            data, err, level = cache:get("key", nil, function() error "oops" end)
+            ngx.say(string.format("data=%s (%s); err=%s; level=%s", data, type(data), err, level))
+
+            ngx.say("sleeping...")
+            ngx.sleep(0.25) -- more than stale_ttl but less than ttl
+
+            local data, err, level = cache:get("key", nil, function()
+                return 25
+            end)
+            ngx.say(string.format("data=%s (%s); err=%s; level=%s", data, type(data), err, level))
+        }
+    }
+--- request
+GET /t
+--- response_body
+data=42 (number); err=nil; level=3
+data=42 (number); err=nil; level=1
+sleeping...
+data=42 (number); err=nil; level=4
+data=42 (number); err=nil; level=1
+sleeping...
+data=25 (number); err=nil; level=3
+--- no_error_log
+[error]
+
+
+
+=== TEST 48: get() also fetch stale negative hits
+--- http_config eval: $::HttpConfig
+--- config
+    location = /t {
+        content_by_lua_block {
+            local mlcache = require "resty.mlcache"
+
+            local cache = assert(mlcache.new("my_mlcache", "cache_shm", {
+                ttl = 0.3,
+                neg_ttl = 0.3,
+                shm_miss = "cache_shm_miss",
+            }))
+
+            local data, err, level = cache:get("key", nil, function()
+                return nil
+            end)
+            ngx.say(string.format("data=%s (%s); err=%s; level=%s", data, type(data), err, level))
+
+            data, err, level = cache:get("key", nil, error)
+            ngx.say(string.format("data=%s (%s); err=%s; level=%s", data, type(data), err, level))
+
+            ngx.say("sleeping...")
+            ngx.sleep(0.4)
+
+            data, err, level = cache:get("key", { stale_ttl = 0.2 }, function()
+                return nil, "timeout"
+            end)
+            ngx.say(string.format("data=%s (%s); err=%s; level=%s", data, type(data), err, level))
+
+            data, err, level = cache:get("key", nil, function() error "oops" end)
+            ngx.say(string.format("data=%s (%s); err=%s; level=%s", data, type(data), err, level))
+
+            ngx.say("sleeping...")
+            ngx.sleep(0.25) -- more than stale_ttl but less than ttl
+
+            local data, err, level = cache:get("key", nil, function()
+                return 25
+            end)
+            ngx.say(string.format("data=%s (%s); err=%s; level=%s", data, type(data), err, level))
+        }
+    }
+--- request
+GET /t
+--- response_body
+data=nil (nil); err=nil; level=3
+data=nil (nil); err=nil; level=1
+sleeping...
+data=nil (nil); err=nil; level=4
+data=nil (nil); err=nil; level=1
+sleeping...
+data=25 (number); err=nil; level=3
+--- no_error_log
+[error]
